@@ -1,0 +1,16 @@
+# A股2200+因子ETL管道 - 依赖
+# ================================
+# 数据源: westock-data (腾讯源, 通过 npx 调用)
+# akshare 仅用于获取股票列表代码(轻量)
+
+# Python 依赖
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+scipy>=1.10.0
+schedule>=1.2.0
+akshare>=1.14.0        # 仅用于股票列表获取，可选
+
+# 系统依赖
+# Node.js >= v18 (westock-data 运行环境)
+# 安装后首次运行 npx 会自动拉取 westock-data-skillhub@1.0.3
