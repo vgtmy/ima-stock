@@ -29,11 +29,12 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
 from io import StringIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import (
     DATA_DIR, OUTPUT_DIR, MAX_RETRIES, RETRY_DELAY,
     REQUEST_INTERVAL, LOOKBACK_DAYS, BATCH_SIZE,
-    COOLDOWN_AFTER_FAILURES, COOLDOWN_SLEEP, logger
+    COOLDOWN_AFTER_FAILURES, COOLDOWN_SLEEP, CONCURRENT_WORKERS, logger
 )
 
 # ============================================================
@@ -41,10 +42,12 @@ from config import (
 # ============================================================
 WESTOCK_CMD = "npx -y westock-data-skillhub@1.0.3"
 
-def _run_westock(subcmd: str, args: str = "", timeout: int = 60) -> str:
+def _run_westock(subcmd: str, args: str = "", timeout: int = 60, max_retries: int = None) -> str:
     """执行 westock-data CLI 命令，返回原始 stdout（UTF-8编码）"""
+    if max_retries is None:
+        max_retries = MAX_RETRIES
     cmd = f"{WESTOCK_CMD} {subcmd} {args}".strip()
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
             # Windows 默认用 GBK 解码，westock-data 输出 UTF-8，必须显式指定
             result = subprocess.run(
@@ -63,11 +66,15 @@ def _run_westock(subcmd: str, args: str = "", timeout: int = 60) -> str:
         except subprocess.TimeoutExpired:
             logger.warning(f"  [{subcmd}] 超时({timeout}s), 第{attempt+1}次")
         except Exception as e:
-            logger.warning(f"  [{subcmd}] 第{attempt+1}次失败: {e}")
-        if attempt < MAX_RETRIES - 1:
+            if max_retries <= 1:
+                # 单次尝试，不打warning，用debug
+                logger.debug(f"  [{subcmd}] 失败: {e}")
+            else:
+                logger.warning(f"  [{subcmd}] 第{attempt+1}次失败: {e}")
+        if attempt < max_retries - 1:
             wait = RETRY_DELAY * (2 ** attempt)
             time.sleep(wait)
-    raise RuntimeError(f"westock {subcmd} 重试{MAX_RETRIES}次后仍失败")
+    raise RuntimeError(f"westock {subcmd} 重试{max_retries}次后仍失败")
 
 
 def _parse_markdown_table(text: str) -> Optional[pd.DataFrame]:
@@ -148,6 +155,47 @@ def _parse_batch_markdown(text: str) -> Dict[str, pd.DataFrame]:
                 result[str(sym)] = group.drop(columns=[group_col], errors="ignore").reset_index(drop=True)
         else:
             result["_single"] = df
+    return result
+
+
+# ============================================================
+# 通用并发拉取框架
+# ============================================================
+def _parallel_fetch_stocks(
+    codes: List[str],
+    fetch_single_fn,
+    label: str,
+    progress_step: int = 100,
+    max_workers: int = None,
+) -> Dict:
+    """
+    通用并发拉取框架 — 对 codes 列表中的每个代码调用 fetch_single_fn(code)，
+    用 ThreadPoolExecutor 并发执行，实时报告进度。
+
+    fetch_single_fn 签名: (code: str) -> Optional[Tuple[str, Any]]
+        - 成功返回 (code, data)
+        - 失败返回 None
+    """
+    if max_workers is None:
+        max_workers = CONCURRENT_WORKERS
+    result = {}
+    total = len(codes)
+    done_count = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_single_fn, code): code for code in codes}
+        for future in as_completed(futures):
+            done_count += 1
+            try:
+                res = future.result()
+                if res is not None:
+                    code, data = res
+                    result[code] = data
+            except Exception:
+                pass
+            if done_count % progress_step == 0 or done_count == total:
+                logger.info(f"  [{label}] 进度: {done_count}/{total} ({len(result)}只)")
+
     return result
 
 
@@ -399,17 +447,30 @@ def _fetch_kline_batch(codes: List[str], period: str = "day", limit: int = 300) 
 
 def fetch_all_klines(stock_list: pd.DataFrame, start_date: str = None, end_date: str = None) -> Dict[str, pd.DataFrame]:
     """
-    批量获取全量股票日线K线
+    批量获取全量股票日线K线 — 支持断点续跑
+    每100只自动存缓存，中断后重跑自动跳过已完成的
     返回: {股票代码: DataFrame}
     """
-    # westock 用 limit 而非日期范围，根据 LOOKBACK_DAYS 计算 limit
-    # 大约 250 交易日 ≈ 365 自然日
     limit = min(LOOKBACK_DAYS + 50, 2000)  # westock 最大 2000
-
-    logger.info(f"[日线K线] 批量拉取 {len(stock_list)} 只, limit={limit}")
-    all_data = {}
     codes = stock_list["股票代码"].tolist()
+
+    # ---- 断点续跑：加载已有缓存 ----
+    kline_cache_file = "klines_cache.pkl"
+    all_data = load_cache(kline_cache_file)
+    if all_data is not None and len(all_data) > 0:
+        # 过滤掉已完成的代码
+        remaining = [c for c in codes if c not in all_data]
+        logger.info(f"[日线K线] 🔄 断点续跑: 已有 {len(all_data)} 只, 剩余 {len(remaining)} 只")
+        codes = remaining
+        if len(codes) == 0:
+            logger.info(f"[日线K线] ✅ 全部完成 (缓存恢复)")
+            return all_data
+    else:
+        all_data = {}
+        logger.info(f"[日线K线] 批量拉取 {len(codes)} 只, limit={limit}")
+
     consecutive_failures = 0
+    save_counter = 0
 
     for i in range(0, len(codes), 20):
         batch = codes[i:i + 20]
@@ -417,19 +478,30 @@ def fetch_all_klines(stock_list: pd.DataFrame, start_date: str = None, end_date:
             batch_result = _fetch_kline_batch(batch, limit=limit)
             all_data.update(batch_result)
             consecutive_failures = 0
+            save_counter += len(batch_result)
         except Exception:
             consecutive_failures += len(batch)
 
         # 连续失败冷却
         if consecutive_failures >= COOLDOWN_AFTER_FAILURES * 20:
             logger.warning(f"  ⚠️ 连续失败较多，进入冷却 {COOLDOWN_SLEEP:.0f}s...")
+            # 先保存当前进度
+            save_cache(all_data, kline_cache_file)
             time.sleep(COOLDOWN_SLEEP)
             consecutive_failures = 0
 
-        if (i + 20) % BATCH_SIZE < 20:
-            logger.info(f"  进度: {min(i+20, len(codes))}/{len(codes)} ({len(all_data)}只成功)")
+        # 每100只保存一次增量缓存
+        if save_counter >= 100:
+            save_cache(all_data, kline_cache_file)
+            logger.info(f"  💾 增量缓存已保存 ({len(all_data)}只)")
+            save_counter = 0
 
-    logger.info(f"[日线K线] ✅ 成功拉取 {len(all_data)}/{len(codes)} 只")
+        if (i + 20) % BATCH_SIZE < 20:
+            logger.info(f"  进度: {len(all_data)}/{len(stock_list)} ({len(all_data)}只成功)")
+
+    # 最终保存
+    save_cache(all_data, kline_cache_file)
+    logger.info(f"[日线K线] ✅ 成功拉取 {len(all_data)}/{len(stock_list)} 只")
     return all_data
 
 
@@ -437,74 +509,80 @@ def fetch_all_klines(stock_list: pd.DataFrame, start_date: str = None, end_date:
 # 3. 财务报表
 # ============================================================
 def _fetch_finance_batch(codes: List[str], num_periods: int = 4) -> Dict[str, Dict[str, pd.DataFrame]]:
-    """批量获取财务报表"""
+    """获取财务报表 — 逐只获取（finance 不支持批量，rc=1通常表示无数据不需重试）"""
     symbols = [_to_westock_code(c) for c in codes]
     result = {}
-    batch_size = 10  # 财报数据量大，控制批量
 
-    for start in range(0, len(symbols), batch_size):
-        batch = symbols[start:start + batch_size]
-        batch_str = ",".join(batch)
+    for sym in symbols:
         try:
-            text = _run_westock("finance", f"{batch_str} --num {num_periods}", timeout=120)
-            # finance 返回分段表格（lrb / zcfz / xjll），需要分段解析
+            # finance 通常不支持批量，且 rc=1 多为"无数据"，只试1次
+            text = _run_westock("finance", f"{sym} --num {num_periods}", timeout=30, max_retries=1)
+            reports = {}
             sections = re.split(r'\n\*\*(lrb|zcfz|xjll)\*\*\n', text)
-            current_sym = None
+            pure_code = _from_westock_code(sym)
 
-            # 找到所有 symbol 对应的数据
-            # 简化处理：逐只获取（财报批量格式较复杂）
+            for idx in range(1, len(sections), 2):
+                rtype_key = sections[idx]  # lrb / zcfz / xjll
+                table_text = sections[idx + 1] if idx + 1 < len(sections) else ""
+                df = _parse_markdown_table(table_text)
+                if df is not None and len(df) > 0:
+                    type_map = {"lrb": "利润表", "zcfz": "资产负债表", "xjll": "现金流量表"}
+                    reports[type_map.get(rtype_key, rtype_key)] = df
+
+            if reports:
+                result[pure_code] = reports
         except Exception:
             pass
-
-        # 回退到逐只获取
-        for sym in batch:
-            try:
-                text = _run_westock("finance", f"{sym} --num {num_periods}", timeout=30)
-                reports = {}
-                sections = re.split(r'\n\*\*(lrb|zcfz|xjll)\*\*\n', text)
-                pure_code = _from_westock_code(sym)
-
-                for idx in range(1, len(sections), 2):
-                    rtype_key = sections[idx]  # lrb / zcfz / xjll
-                    table_text = sections[idx + 1] if idx + 1 < len(sections) else ""
-                    df = _parse_markdown_table(table_text)
-                    if df is not None and len(df) > 0:
-                        # 统一报表类型名称
-                        type_map = {"lrb": "利润表", "zcfz": "资产负债表", "xjll": "现金流量表"}
-                        reports[type_map.get(rtype_key, rtype_key)] = df
-
-                if reports:
-                    result[pure_code] = reports
-            except Exception:
-                pass
-            time.sleep(0.2)
-
-        time.sleep(REQUEST_INTERVAL)
+        time.sleep(0.15)  # 财报逐只，短间隔即可
 
     return result
 
 
 def fetch_all_financials(stock_list: pd.DataFrame) -> Dict[str, Dict[str, pd.DataFrame]]:
     """
-    批量获取全量股票三大报表
+    批量获取全量股票三大报表 — 支持断点续跑
+    每100只自动存缓存，中断后重跑自动跳过已完成的
     返回: {股票代码: {"利润表": df, "资产负债表": df, "现金流量表": df}}
     """
-    logger.info(f"[财务报表] 批量拉取 {len(stock_list)} 只")
-    all_data = {}
     codes = stock_list["股票代码"].tolist()
+
+    # ---- 断点续跑 ----
+    fin_cache_file = "financials_cache.pkl"
+    all_data = load_cache(fin_cache_file)
+    if all_data is not None and len(all_data) > 0:
+        remaining = [c for c in codes if c not in all_data]
+        logger.info(f"[财务报表] 🔄 断点续跑: 已有 {len(all_data)} 只, 剩余 {len(remaining)} 只")
+        codes = remaining
+        if len(codes) == 0:
+            logger.info(f"[财务报表] ✅ 全部完成 (缓存恢复)")
+            return all_data
+    else:
+        all_data = {}
+        logger.info(f"[财务报表] 批量拉取 {len(codes)} 只")
+
+    save_counter = 0
 
     for i in range(0, len(codes), 10):
         batch = codes[i:i + 10]
         try:
             batch_result = _fetch_finance_batch(batch)
             all_data.update(batch_result)
+            save_counter += len(batch_result)
         except Exception:
             pass
 
-        if (i + 10) % BATCH_SIZE < 10:
-            logger.info(f"  进度: {min(i+10, len(codes))}/{len(codes)} ({len(all_data)}只完整)")
+        # 每100只保存一次增量缓存
+        if save_counter >= 100:
+            save_cache(all_data, fin_cache_file)
+            logger.info(f"  💾 增量缓存已保存 ({len(all_data)}只)")
+            save_counter = 0
 
-    logger.info(f"[财务报表] ✅ 完整获取 {len(all_data)}/{len(codes)} 只")
+        if (i + 10) % BATCH_SIZE < 10:
+            logger.info(f"  进度: {len(all_data)}/{len(stock_list)} ({len(all_data)}只完整)")
+
+    # 最终保存
+    save_cache(all_data, fin_cache_file)
+    logger.info(f"[财务报表] ✅ 完整获取 {len(all_data)}/{len(stock_list)} 只")
     return all_data
 
 
@@ -564,7 +642,7 @@ def _fetch_asfund_batch(codes: List[str]) -> Dict[str, pd.DataFrame]:
                         result[pure_code] = df
                 except Exception:
                     pass
-                time.sleep(0.2)
+                time.sleep(0.15)
 
         time.sleep(REQUEST_INTERVAL)
 
@@ -594,33 +672,28 @@ def fetch_all_fund_flow(stock_list: pd.DataFrame, days: int = 30) -> Dict[str, p
 # ============================================================
 # 5. 融资融券
 # ============================================================
-def _fetch_margintrade_batch(codes: List[str]) -> Dict[str, pd.DataFrame]:
-    """获取融资融券数据（margintrade 不支持批量，逐只获取）"""
-    result = {}
-
-    for code in codes:
-        ws_code = _to_westock_code(code)
-        try:
-            text = _run_westock("margintrade", ws_code, timeout=30)
-            df = _parse_markdown_table(text)
-            if df is not None and len(df) > 0:
-                col_map = {
-                    "FinanceValue": "融资余额",
-                    "SecurityValue": "融券余额",
-                    "FinanceBuyValue": "融资买入额",
-                    "FinanceRefundValue": "融资偿还额",
-                    "TradingValue": "融资融券余额",
-                    "TradingValueDif": "融资融券余额差额",
-                    "FinanceValueDOD": "融资余额日变动",
-                    "SecurityValueDOD": "融券余额日变动",
-                }
-                df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-                result[code] = df
-        except Exception:
-            pass
-        time.sleep(0.2)
-
-    return result
+def _fetch_margintrade_single(code: str):
+    """获取单只股票融资融券数据"""
+    ws_code = _to_westock_code(code)
+    try:
+        text = _run_westock("margintrade", ws_code, timeout=30, max_retries=1)
+        df = _parse_markdown_table(text)
+        if df is not None and len(df) > 0:
+            col_map = {
+                "FinanceValue": "融资余额",
+                "SecurityValue": "融券余额",
+                "FinanceBuyValue": "融资买入额",
+                "FinanceRefundValue": "融资偿还额",
+                "TradingValue": "融资融券余额",
+                "TradingValueDif": "融资融券余额差额",
+                "FinanceValueDOD": "融资余额日变动",
+                "SecurityValueDOD": "融券余额日变动",
+            }
+            df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+            return (code, df)
+    except Exception:
+        pass
+    return None
 
 
 def fetch_margin_data(date_str: str = None) -> Dict[str, pd.DataFrame]:
@@ -650,11 +723,11 @@ def fetch_north_bound(stock_list: pd.DataFrame) -> Dict[str, dict]:
 # ============================================================
 # 7. 股东结构
 # ============================================================
-def _fetch_shareholder_single(code: str) -> Optional[dict]:
-    """获取单只股票股东结构"""
+def _fetch_shareholder_single(code: str):
+    """获取单只股票股东结构（1次重试），返回 (code, data) 或 None"""
     ws_code = _to_westock_code(code)
     try:
-        text = _run_westock("shareholder", ws_code, timeout=30)
+        text = _run_westock("shareholder", ws_code, timeout=30, max_retries=1)
         # shareholder 返回混合格式（标题 + 多个表格），需要分段解析
         result = {"股票代码": code}
 
@@ -686,26 +759,20 @@ def _fetch_shareholder_single(code: str) -> Optional[dict]:
             if df is not None:
                 result["十大流通股东"] = df
 
-        return result if len(result) > 1 else None
+        if len(result) > 1:
+            return (code, result)
     except Exception:
-        return None
+        pass
+    return None
 
 
 def fetch_shareholders(stock_list: pd.DataFrame) -> Dict[str, dict]:
-    """获取股东结构数据"""
-    logger.info(f"[股东结构] 批量拉取 {len(stock_list)} 只...")
-    all_data = {}
+    """获取股东结构数据（8线程并发）"""
     codes = stock_list["股票代码"].tolist()
-
-    for i, code in enumerate(codes):
-        result = _fetch_shareholder_single(code)
-        if result is not None:
-            all_data[code] = result
-        if (i + 1) % BATCH_SIZE == 0:
-            logger.info(f"  进度: {i+1}/{len(codes)} ({len(all_data)}只)")
-        time.sleep(0.3)
-
-    logger.info(f"[股东结构] ✅ 获取 {len(all_data)}/{len(codes)} 只")
+    logger.info(f"[股东结构] 并发拉取 {len(codes)} 只 ({CONCURRENT_WORKERS}线程)...")
+    result = _parallel_fetch_stocks(codes, _fetch_shareholder_single, "股东", progress_step=BATCH_SIZE)
+    logger.info(f"[股东结构] ✅ 获取 {len(result)}/{len(codes)} 只")
+    return result
     return all_data
 
 
@@ -732,14 +799,14 @@ def _fetch_technical_batch(codes: List[str]) -> Dict[str, pd.DataFrame]:
         except Exception:
             for sym in batch:
                 try:
-                    text = _run_westock("technical", f"{sym} --group all", timeout=30)
+                    text = _run_westock("technical", f"{sym} --group all", timeout=30, max_retries=1)
                     df = _parse_markdown_table(text)
                     if df is not None and len(df) > 0:
                         pure_code = _from_westock_code(sym)
                         result[pure_code] = df
                 except Exception:
                     pass
-                time.sleep(0.2)
+                time.sleep(0.15)
         time.sleep(REQUEST_INTERVAL)
 
     return result
@@ -748,50 +815,40 @@ def _fetch_technical_batch(codes: List[str]) -> Dict[str, pd.DataFrame]:
 # ============================================================
 # 9. 筹码成本
 # ============================================================
-def _fetch_chip_batch(codes: List[str]) -> Dict[str, pd.DataFrame]:
-    """获取筹码成本（chip 批量格式特殊，逐只获取）"""
-    result = {}
-
-    for code in codes:
-        ws_code = _to_westock_code(code)
-        try:
-            text = _run_westock("chip", ws_code, timeout=30)
-            df = _parse_markdown_table(text)
-            if df is not None and len(df) > 0:
-                col_map = {
-                    "chipProfitRate": "盈利率",
-                    "chipAvgCost": "平均成本",
-                    "chipConcentration90": "集中度90",
-                    "chipConcentration70": "集中度70",
-                }
-                df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-                result[code] = df
-        except Exception:
-            pass
-        time.sleep(0.2)
-
-    return result
+def _fetch_chip_single(code: str):
+    """获取单只股票筹码成本，返回 (code, df) 或 None"""
+    ws_code = _to_westock_code(code)
+    try:
+        text = _run_westock("chip", ws_code, timeout=30, max_retries=1)
+        df = _parse_markdown_table(text)
+        if df is not None and len(df) > 0:
+            col_map = {
+                "chipProfitRate": "盈利率",
+                "chipAvgCost": "平均成本",
+                "chipConcentration90": "集中度90",
+                "chipConcentration70": "集中度70",
+            }
+            df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+            return (code, df)
+    except Exception:
+        pass
+    return None
 
 
 # ============================================================
 # 10. 分红数据
 # ============================================================
-def _fetch_dividend_batch(codes: List[str], years: int = 5) -> Dict[str, pd.DataFrame]:
-    """获取分红数据（逐只获取）"""
-    result = {}
-
-    for code in codes:
-        ws_code = _to_westock_code(code)
-        try:
-            text = _run_westock("dividend", f"{ws_code} --years {years}", timeout=30)
-            df = _parse_markdown_table(text)
-            if df is not None and len(df) > 0:
-                result[code] = df
-        except Exception:
-            pass
-        time.sleep(0.2)
-
-    return result
+def _fetch_dividend_single(code: str, years: int = 5):
+    """获取单只股票分红数据，返回 (code, df) 或 None"""
+    ws_code = _to_westock_code(code)
+    try:
+        text = _run_westock("dividend", f"{ws_code} --years {years}", timeout=30, max_retries=1)
+        df = _parse_markdown_table(text)
+        if df is not None and len(df) > 0:
+            return (code, df)
+    except Exception:
+        pass
+    return None
 
 
 # ============================================================
@@ -881,10 +938,23 @@ def fetch_all_data(target_date: str = None, use_cache: bool = True) -> dict:
     """
     一键采集所有原始数据（westock-data 腾讯源版）
     target_date: YYYY-MM-DD 格式，默认最新交易日
+    use_cache: 是否使用各模块的增量缓存（K线/财报等）
     返回包含所有原始数据的字典
     """
     if target_date is None:
         target_date = datetime.now().strftime("%Y-%m-%d")
+
+    # ---- 尝试从完整快照恢复（如果存在则直接跳过整个采集）----
+    snapshot_file = f"raw_data_{target_date}.pkl"
+    snapshot_path = os.path.join(DATA_DIR, snapshot_file)
+    if os.path.exists(snapshot_path):
+        try:
+            with open(snapshot_path, "rb") as f:
+                raw_data = pickle.load(f)
+            logger.info(f"📦 从快照恢复原始数据: {snapshot_file} ({len(raw_data.get('stock_list', []))} 只股票)")
+            return raw_data
+        except Exception as e:
+            logger.warning(f"⚠️ 快照加载失败，重新采集: {e}")
 
     start_date = (datetime.strptime(target_date, "%Y-%m-%d")
                   - timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
@@ -897,37 +967,19 @@ def fetch_all_data(target_date: str = None, use_cache: bool = True) -> dict:
     # 1. 股票列表
     stock_list = fetch_stock_list(use_cache=use_cache)
 
-    # ---- 断点恢复 ----
-    checkpoint = load_cache("checkpoint.pkl")
-    if checkpoint is not None:
-        logger.info(f"[断点] 🔄 从缓存恢复 — K线:{len(checkpoint.get('klines',{}))}只, 财报:{len(checkpoint.get('financials',{}))}只")
-        klines = checkpoint["klines"]
-        financials = checkpoint["financials"]
-    else:
-        # 2. 日线K线
-        klines = fetch_all_klines(stock_list, start_date, end_date)
-        # 3. 财务报表
-        financials = fetch_all_financials(stock_list)
-        # 保存断点
-        save_cache({"klines": klines, "financials": financials}, "checkpoint.pkl")
-        logger.info("[断点] 💾 中间缓存已保存 (K线+财报)")
+    # 2. 日线K线（自带增量缓存 klines_cache.pkl，断点续跑）
+    klines = fetch_all_klines(stock_list, start_date, end_date)
+
+    # 3. 财务报表（自带增量缓存 financials_cache.pkl，断点续跑）
+    financials = fetch_all_financials(stock_list)
 
     # 4. 资金流向（含北向资金 LgtHoldInfo）
     fund_flows = fetch_all_fund_flow(stock_list)
 
     # 5. 融资融券（从 asfund 的 MarginTradeInfos 或单独 margintrade）
     codes = stock_list["股票代码"].tolist()
-    margin = {}
-    logger.info("[融资融券] 批量拉取...")
-    for i in range(0, len(codes), 20):
-        batch = codes[i:i + 20]
-        try:
-            batch_result = _fetch_margintrade_batch(batch)
-            margin.update(batch_result)
-        except Exception:
-            pass
-        if (i + 20) % BATCH_SIZE < 20:
-            logger.info(f"  进度: {min(i+20, len(codes))}/{len(codes)} ({len(margin)}只)")
+    logger.info(f"[融资融券] 并发拉取 {len(codes)} 只 ({CONCURRENT_WORKERS}线程)...")
+    margin = _parallel_fetch_stocks(codes, _fetch_margintrade_single, "融资融券", progress_step=BATCH_SIZE)
     logger.info(f"[融资融券] ✅ 获取 {len(margin)}/{len(codes)} 只")
 
     # 6. 北向资金 — 从 fund_flows 的 LgtHoldInfo 提取
@@ -965,31 +1017,13 @@ def fetch_all_data(target_date: str = None, use_cache: bool = True) -> dict:
     logger.info(f"[技术指标] ✅ 获取 {len(technicals)}/{len(codes)} 只")
 
     # 9. 筹码成本
-    logger.info("[筹码成本] 批量拉取...")
-    chips = {}
-    for i in range(0, len(codes), 20):
-        batch = codes[i:i + 20]
-        try:
-            batch_result = _fetch_chip_batch(batch)
-            chips.update(batch_result)
-        except Exception:
-            pass
-        if (i + 20) % BATCH_SIZE < 20:
-            logger.info(f"  进度: {min(i+20, len(codes))}/{len(codes)} ({len(chips)}只)")
+    logger.info(f"[筹码成本] 并发拉取 {len(codes)} 只 ({CONCURRENT_WORKERS}线程)...")
+    chips = _parallel_fetch_stocks(codes, _fetch_chip_single, "筹码", progress_step=BATCH_SIZE)
     logger.info(f"[筹码成本] ✅ 获取 {len(chips)}/{len(codes)} 只")
 
     # 10. 分红数据
-    logger.info("[分红数据] 批量拉取...")
-    dividends = {}
-    for i in range(0, len(codes), 20):
-        batch = codes[i:i + 20]
-        try:
-            batch_result = _fetch_dividend_batch(batch)
-            dividends.update(batch_result)
-        except Exception:
-            pass
-        if (i + 20) % BATCH_SIZE < 20:
-            logger.info(f"  进度: {min(i+20, len(codes))}/{len(codes)} ({len(dividends)}只)")
+    logger.info(f"[分红数据] 并发拉取 {len(codes)} 只 ({CONCURRENT_WORKERS}线程)...")
+    dividends = _parallel_fetch_stocks(codes, _fetch_dividend_single, "分红", progress_step=BATCH_SIZE)
     logger.info(f"[分红数据] ✅ 获取 {len(dividends)}/{len(codes)} 只")
 
     # 11. 行业分类
@@ -1002,13 +1036,15 @@ def fetch_all_data(target_date: str = None, use_cache: bool = True) -> dict:
     logger.info("✅ 数据采集完成")
     logger.info("=" * 60)
 
-    # 全部完成，清除断点缓存
-    cp = os.path.join(DATA_DIR, "checkpoint.pkl")
-    if os.path.exists(cp):
-        os.remove(cp)
-        logger.info("[断点] 🗑️ 缓存已清除（全部步骤完成）")
+    # 全部完成，清除增量缓存（可选，保留下次增量更新时仍可用）
+    for cache_name in ["klines_cache.pkl", "financials_cache.pkl"]:
+        cp = os.path.join(DATA_DIR, cache_name)
+        if os.path.exists(cp):
+            # 不删除，保留用于下次增量更新
+            logger.info(f"[缓存] 保留 {cache_name} 用于下次增量更新")
 
-    return {
+    # ---- 保存完整快照到磁盘（下次直接加载，跳过整个采集过程）----
+    raw_data = {
         "target_date": target_date,
         "stock_list": stock_list,
         "klines": klines,
@@ -1023,3 +1059,12 @@ def fetch_all_data(target_date: str = None, use_cache: bool = True) -> dict:
         "industry_map": industry_map,
         "concept_map": concept_map,
     }
+    try:
+        sp = os.path.join(DATA_DIR, f"raw_data_{target_date}.pkl")
+        with open(sp, "wb") as f:
+            pickle.dump(raw_data, f)
+        logger.info(f"📦 原始数据快照已保存: raw_data_{target_date}.pkl ({len(stock_list)} 只股票)")
+    except Exception as e:
+        logger.warning(f"⚠️ 快照保存失败（不影响本次执行）: {e}")
+
+    return raw_data

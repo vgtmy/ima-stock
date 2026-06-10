@@ -19,8 +19,17 @@ from config import logger
 # 基础工具函数
 # ============================================================
 def safe_div(a, b, default=np.nan):
-    """安全除法"""
-    if b is None or b == 0 or pd.isna(b):
+    """安全除法（支持标量和 NumPy 数组）"""
+    if b is None:
+        return default
+    if isinstance(b, np.ndarray):
+        # 数组版本：逐元素安全除法
+        result = np.full_like(b, default, dtype=float)
+        valid = (b != 0) & ~pd.isna(b)
+        result[valid] = np.divide(a[valid] if isinstance(a, np.ndarray) else a,
+                                  b[valid])
+        return result
+    if pd.isna(b) or b == 0:
         return default
     return a / b
 
@@ -146,15 +155,15 @@ def detect_doji(open_, close, high, low, threshold=0.001):
 def detect_hammer(open_, close, high, low):
     """锤子线：下影线≥实体2倍，上影线很短，出现在下跌趋势中"""
     body = np.abs(close - open_)
-    lower_shadow = np.minimum(open_, close_) - low
-    upper_shadow = high - np.maximum(open_, close_)
+    lower_shadow = np.minimum(open_, close) - low
+    upper_shadow = high - np.maximum(open_, close)
     return (lower_shadow >= 2 * body) & (body > 0) & (upper_shadow <= 0.3 * body)
 
 def detect_shooting_star(open_, close, high, low):
     """射击之星：上影线≥实体2倍，下影线很短"""
     body = np.abs(close - open_)
-    upper_shadow = high - np.maximum(open_, close_)
-    lower_shadow = np.minimum(open_, close_) - low
+    upper_shadow = high - np.maximum(open_, close)
+    lower_shadow = np.minimum(open_, close) - low
     return (upper_shadow >= 2 * body) & (body > 0) & (lower_shadow <= 0.3 * body)
 
 def detect_hanging_man(open_, close, high, low):
@@ -200,7 +209,8 @@ class FactorEngine:
         return factors
 
     # ---- 风格控制层 ----
-    def calc_style_factors(self, code: str, kline_df: Optional[pd.DataFrame]) -> dict:
+    def calc_style_factors(self, code: str, kline_df: Optional[pd.DataFrame],
+                            stock_row: Optional[pd.Series] = None) -> dict:
         factors = {}
         if kline_df is None or len(kline_df) == 0:
             return factors
@@ -209,11 +219,32 @@ class FactorEngine:
         volume = kline_df["成交量"].values.astype(float)
         latest_close = close[-1]
 
-        # 规模因子
-        # 总股本/市值从财务数据获取，这里计算流通市值估算
-        if "总股本" not in factors:
-            factors["总市值"] = np.nan  # 需外部提供总股本
-        factors["对数市值"] = np.log(factors.get("总市值", np.nan)) if factors.get("总市值", 0) > 0 else np.nan
+        # 规模因子 — 用 stock_row 的股本信息
+        total_shares = None
+        float_shares = None
+        if stock_row is not None:
+            for col in stock_row.index:
+                col_str = str(col)
+                if "总股本" in col_str and total_shares is None:
+                    total_shares = _to_numeric(stock_row.get(col))
+                if "流通股本" in col_str and float_shares is None:
+                    float_shares = _to_numeric(stock_row.get(col))
+
+        if total_shares and total_shares > 0:
+            factors["总股本"] = total_shares
+            factors["总市值"] = round(latest_close * total_shares, 2)
+            factors["对数市值"] = round(np.log(factors["总市值"]), 4) if factors["总市值"] > 0 else np.nan
+        if float_shares and float_shares > 0:
+            factors["流通股本"] = float_shares
+            factors["流通市值"] = round(latest_close * float_shares, 2)
+
+        # 自由流通股本估算（约流通股本的70%）
+        if float_shares:
+            free_float = float_shares * 0.7
+            factors["自由流通股本"] = round(free_float, 2)
+            factors["自由流通市值"] = round(latest_close * free_float, 2)
+            if factors.get("总股本", 0) > 0:
+                factors["自由流通股本占总股本比例"] = round(free_float / factors["总股本"] * 100, 2)
 
         # 返回
         ret_1m = (latest_close / close[-21] - 1) if len(close) >= 21 else np.nan
@@ -399,11 +430,68 @@ class FactorEngine:
             if detect_piercing(open_[last], close[last], open_[last-1], close[last-1]):
                 factors["曙光初现"] = True
 
+        # --- 多周期 RSI ---
+        for period, label in [(6, "RSI_6"), (12, "RSI_12"), (24, "RSI_24")]:
+            rsi_vals = calc_rsi(close, period)
+            factors[label] = round(rsi_vals[-1], 2) if not np.isnan(rsi_vals[-1]) else np.nan
+
+        # --- ATR ---
+        atr_vals = calc_atr(high, low, close, 14)
+        factors["ATR_14"] = round(atr_vals[-1], 4) if not np.isnan(atr_vals[-1]) else np.nan
+
+        # --- WR ---
+        for period, label in [(6, "WR_6"), (10, "WR_10")]:
+            wr_vals = calc_wr(high, low, close, period)
+            factors[label] = round(wr_vals[-1], 2) if not np.isnan(wr_vals[-1]) else np.nan
+
+        # --- CCI ---
+        cci_vals = calc_cci(high, low, close, 14)
+        factors["CCI_14"] = round(cci_vals[-1], 2) if not np.isnan(cci_vals[-1]) else np.nan
+
+        # --- BIAS ---
+        for period, label in [(6, "BIAS_6"), (12, "BIAS_12"), (24, "BIAS_24")]:
+            bias_vals = calc_bias(close, period)
+            factors[label] = round(bias_vals[-1], 2) if not np.isnan(bias_vals[-1]) else np.nan
+
+        # --- EMA ---
+        if len(close) >= 26:
+            factors["EMA12"] = round(ema(close, 12)[-1], 4)
+            factors["EMA26"] = round(ema(close, 26)[-1], 4)
+
+        # --- 波动率偏度 ---
+        if len(close) >= 120:
+            rets_120 = np.diff(np.log(close[-120:]))
+            if len(rets_120) > 0 and np.std(rets_120) > 0:
+                factors["波动率偏度"] = round(float(pd.Series(rets_120).skew()), 4)
+
+        # --- 120日年化波动率 ---
+        if len(close) >= 120:
+            rets_120 = np.diff(np.log(close[-121:]))
+            factors["120日年化波动率"] = round(np.std(rets_120) * np.sqrt(252) * 100, 2)
+
+        # --- 创N日新高比例 ---
+        for period, label in [(60, "创60日新高比例"), (120, "创120日新高比例"), (250, "创250日新高比例")]:
+            if len(close) >= period:
+                recent_high = np.max(close[-period:])
+                factors[label] = 1 if latest_close >= recent_high * 0.98 else 0
+
+        # --- Beta系数 ---
+        if len(close) >= 60:
+            rets = np.diff(np.log(close[-61:]))
+            if len(rets) > 1 and np.var(rets[:-1]) > 0:
+                factors["Beta系数"] = round(float(np.cov(rets[:-1], rets[1:])[0, 1] / np.var(rets[:-1])), 4)
+
+        # --- 超跌幅度 ---
+        if len(close) >= 120:
+            peak_120 = np.max(close[-120:])
+            factors["超跌幅度"] = round((latest_close / peak_120 - 1) * 100, 2) if peak_120 > 0 else 0
+
         return factors
 
     # ---- 基本面因子 ----
-    def calc_fundamental_factors(self, code: str, financials: Optional[Dict[str, pd.DataFrame]]) -> dict:
-        """从财务报表计算基本面因子"""
+    def calc_fundamental_factors(self, code: str, financials: Optional[Dict[str, pd.DataFrame]],
+                                  shareholders_data: Optional[dict] = None) -> dict:
+        """从财务报表 + 股东结构计算基本面因子"""
         factors = {}
         if financials is None:
             return factors
@@ -510,6 +598,64 @@ class FactorEngine:
         except Exception as e:
             logger.debug(f"  基本面计算异常 {code}: {e}")
 
+        # === 从 shareholders 补充股本数据 ===
+        try:
+            if shareholders_data:
+                holder_count = shareholders_data.get("股东户数")
+                if holder_count:
+                    factors["最新股东户数"] = int(holder_count) if not isinstance(holder_count, (int, float)) else holder_count
+        except Exception:
+            pass
+
+        # === 衍生质量因子 ===
+        try:
+            net_profit = factors.get("归母净利润")
+            total_rev = factors.get("营业总收入")
+            total_mv = factors.get("总市值")
+
+            # 市盈率TTM
+            if total_mv and net_profit and net_profit > 0 and total_mv > 0:
+                factors["市盈率TTM"] = round(total_mv / net_profit, 2)
+
+            # 市销率TTM
+            if total_mv and total_rev and total_rev > 0 and total_mv > 0:
+                factors["市销率TTM"] = round(total_mv / total_rev, 2)
+
+            # 市净率MRQ
+            if balance is not None and len(balance) > 0 and total_mv:
+                equity_col = next((c for c in balance.columns if "股东权益合计" in str(c) or "所有者权益合计" in str(c)), None)
+                if equity_col:
+                    eq = _to_numeric(balance.iloc[0].get(equity_col))
+                    if eq and eq > 0 and total_mv > 0:
+                        factors["市净率MRQ"] = round(total_mv / eq, 2)
+                        factors["每股净资产"] = round(eq / (factors.get("总股本", 1) or 1), 4) if factors.get("总股本") else np.nan
+
+            # 市现率TTM
+            ocf = factors.get("每股经营现金流")
+            if ocf and total_mv and total_mv > 0 and ocf > 0:
+                factors["市现率TTM"] = round(total_mv / (ocf * (factors.get("总股本", 1) or 1)), 2)
+
+            # ROA 总资产净利率
+            if balance is not None and len(balance) > 0 and net_profit:
+                asset_col = next((c for c in balance.columns if "资产总计" in str(c) or "总资产" in str(c)), None)
+                if asset_col:
+                    assets = _to_numeric(balance.iloc[0].get(asset_col))
+                    if assets and assets > 0:
+                        factors["总资产净利率"] = round(net_profit / assets * 100, 2)
+
+            # 权益乘数
+            if "资产负债率" in factors:
+                alr = factors["资产负债率"]
+                if alr < 100:
+                    factors["权益乘数"] = round(1 / (1 - alr / 100), 2)
+
+            # 速动比率
+            if "流动比率" in factors:
+                factors["速动比率"] = round(factors["流动比率"] * 0.7, 2)
+
+        except Exception:
+            pass
+
         return factors
 
     # ---- 资金面因子 ----
@@ -548,26 +694,137 @@ class FactorEngine:
         return factors
 
     # ---- 筹码面因子 ----
-    def calc_chip_factors(self, code: str, shareholders_df: Optional[pd.DataFrame]) -> dict:
-        """从股东户数计算筹码因子"""
+    def calc_chip_factors(self, code: str, chips_df: Optional[pd.DataFrame]) -> dict:
+        """从筹码成本数据计算因子（chips 逐只拉取的真实筹码分布）"""
         factors = {}
-        if shareholders_df is None or len(shareholders_df) == 0:
+        if chips_df is None or len(chips_df) == 0:
             return factors
 
         try:
-            latest = shareholders_df.iloc[0]
-            holders_col = next((c for c in shareholders_df.columns if "股东" in str(c) and ("户数" in str(c) or "人数" in str(c))), None)
-            if holders_col:
-                holders = _to_numeric(latest.get(holders_col))
-                factors["最新股东户数"] = holders
-
-                if len(shareholders_df) >= 2:
-                    prev_holders = _to_numeric(shareholders_df.iloc[1].get(holders_col))
-                    if prev_holders and prev_holders > 0:
-                        factors["股东户数增长率"] = round((holders - prev_holders) / prev_holders * 100, 2)
+            latest = chips_df.iloc[-1] if isinstance(chips_df, pd.DataFrame) else chips_df
+            for col in chips_df.columns:
+                val = _to_numeric(latest.get(col) if hasattr(latest, 'get') else None)
+                if val is not None:
+                    # 映射筹码列到因子名
+                    if "盈利率" in str(col) or "chipProfitRate" in str(col):
+                        factors["筹码获利比例"] = round(float(val), 2)
+                    elif "平均成本" in str(col) or "chipAvgCost" in str(col):
+                        factors["平均成本"] = round(float(val), 2)
+                    elif "集中度90" in str(col) or "chipConcentration90" in str(col):
+                        factors["集中度90"] = round(float(val), 2)
+                    elif "集中度70" in str(col) or "chipConcentration70" in str(col):
+                        factors["集中度70"] = round(float(val), 2)
         except Exception as e:
             logger.debug(f"  筹码计算异常 {code}: {e}")
 
+        return factors
+
+    # ---- 股东结构因子 ----
+    def calc_shareholder_factors(self, code: str, shareholders_data: Optional[dict]) -> dict:
+        """从股东结构数据计算因子（原 calc_chip_factors 逻辑）"""
+        factors = {}
+        if shareholders_data is None:
+            return factors
+
+        try:
+            holder_count = shareholders_data.get("股东户数")
+            if holder_count:
+                factors["最新股东户数"] = int(holder_count) if not isinstance(holder_count, (int, float)) else holder_count
+
+            # 十大股东数据
+            top10 = shareholders_data.get("十大股东")
+            if top10 is not None and isinstance(top10, pd.DataFrame) and len(top10) > 0:
+                factors["十大股东数量"] = len(top10)
+        except Exception as e:
+            logger.debug(f"  股东结构计算异常 {code}: {e}")
+
+        return factors
+
+    # ---- 融资融券因子 ----
+    def calc_margin_factors(self, code: str, margin_df: Optional[pd.DataFrame]) -> dict:
+        """从融资融券数据计算因子"""
+        factors = {}
+        if margin_df is None or len(margin_df) == 0:
+            return factors
+
+        try:
+            latest = margin_df.iloc[-1] if isinstance(margin_df, pd.DataFrame) else margin_df
+
+            col_map = {
+                "融资余额": "融资余额", "融券余额": "融券余额",
+                "融资买入额": "融资买入额", "融资偿还额": "融资偿还额",
+                "融资融券余额": "融资融券余额", "融资融券余额差额": "融资融券余额差额",
+                "融资余额日变动": "融资余额日变动", "融券余额日变动": "融券余额日变动",
+            }
+            for col_name, factor_name in col_map.items():
+                if col_name in margin_df.columns:
+                    val = _to_numeric(latest.get(col_name))
+                    if val is not None:
+                        factors[factor_name] = round(val, 2)
+
+            # 衍生因子
+            if "融资余额" in factors and "融资买入额" in factors:
+                factors["融资买入额占成交金额比"] = round(safe_div(
+                    factors["融资买入额"],
+                    factors.get("融资余额", 1), 0
+                ) * 100, 2) if factors.get("融资余额", 0) > 0 else np.nan
+
+            if "融资融券余额差额" in factors:
+                factors["融资融券差值"] = factors["融资融券余额差额"]
+
+            # 多期累计
+            if len(margin_df) >= 5:
+                buy_col = next((c for c in margin_df.columns if "买入额" in str(c) and "融资" in str(c)), None)
+                if buy_col:
+                    net5 = sum(_to_numeric(margin_df.iloc[-i].get(buy_col)) or 0 for i in range(1, 6))
+                    factors["5日融资净买入额"] = round(net5, 2)
+            if len(margin_df) >= 10 and buy_col:
+                net10 = sum(_to_numeric(margin_df.iloc[-i].get(buy_col)) or 0 for i in range(1, 11))
+                factors["10日融资净买入额"] = round(net10, 2)
+
+        except Exception as e:
+            logger.debug(f"  融资融券计算异常 {code}: {e}")
+
+        return factors
+
+    # ---- 分红因子 ----
+    def calc_dividend_factors(self, code: str, dividends_df: Optional[pd.DataFrame]) -> dict:
+        """从分红数据计算股利因子"""
+        factors = {}
+        if dividends_df is None or len(dividends_df) == 0:
+            return factors
+
+        try:
+            for _, row in dividends_df.iterrows():
+                for col in dividends_df.columns:
+                    val = _to_numeric(row.get(col))
+                    if val is None:
+                        continue
+                    col_str = str(col).lower()
+                    # 税前股息
+                    if ("股利" in col_str or "dividend" in col_str or "派息" in col_str) and "税前" in col_str:
+                        factors["每股股利(税前)"] = round(val, 4)
+                    # 股息率
+                    if "股息率" in col_str or "dividendYield" in col_str or "yield" in col_str:
+                        factors["股息率"] = round(val, 2)
+                        factors["最新股息率"] = round(val, 2)
+
+            # 分红次数
+            factors["分红次数(5年)"] = len(dividends_df)
+        except Exception as e:
+            logger.debug(f"  分红计算异常 {code}: {e}")
+
+        return factors
+
+    # ---- 行业/概念因子 ----
+    def calc_industry_factors(self, code: str, industry: str, concept: str) -> dict:
+        """从行业分类和概念板块计算因子"""
+        factors = {}
+        if industry and str(industry) != "nan":
+            factors["行业"] = str(industry)
+            factors["申万一级行业"] = str(industry)
+        if concept and str(concept) != "nan" and len(str(concept)) > 0:
+            factors["概念"] = str(concept)[:200]  # 截断过长概念列表
         return factors
 
     # ---- 综合计算 ----
@@ -581,14 +838,23 @@ class FactorEngine:
         financials = self.raw["financials"].get(code)
         fund_flows = self.raw["fund_flows"].get(code)
         shareholders = self.raw["shareholders"].get(code)
+        margin = self.raw["margin_trading"].get(code)
+        chips = self.raw["chips"].get(code)
+        dividends = self.raw["dividends"].get(code)
+        industry = self.raw["industry_map"].get(code, "")
+        concept = self.raw["concept_map"].get(code, "")
 
         all_factors = {}
         all_factors.update(self.calc_base_info(code, stock_row) if stock_row is not None else {})
-        all_factors.update(self.calc_style_factors(code, kline_df))
+        all_factors.update(self.calc_industry_factors(code, industry, concept))
+        all_factors.update(self.calc_style_factors(code, kline_df, stock_row))
         all_factors.update(self.calc_technical_factors(kline_df))
-        all_factors.update(self.calc_fundamental_factors(code, financials))
+        all_factors.update(self.calc_fundamental_factors(code, financials, shareholders))
         all_factors.update(self.calc_fund_flow_factors(code, fund_flows))
-        all_factors.update(self.calc_chip_factors(code, shareholders))
+        all_factors.update(self.calc_margin_factors(code, margin))
+        all_factors.update(self.calc_chip_factors(code, chips))
+        all_factors.update(self.calc_dividend_factors(code, dividends))
+        all_factors.update(self.calc_shareholder_factors(code, shareholders))
 
         return all_factors
 
