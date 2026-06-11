@@ -289,6 +289,7 @@ class FactorEngine:
         low = kline_df["最低"].values.astype(float)
         close = kline_df["收盘"].values.astype(float)
         volume = kline_df["成交量"].values.astype(float)
+        latest_close = close[-1]
 
         # --- MACD ---
         dif, dea, macd_bar = calc_macd(close)
@@ -830,38 +831,67 @@ class FactorEngine:
     # ---- 综合计算 ----
     def calc_all_factors(self, code: str) -> dict:
         """计算单只股票的全部因子"""
-        stock_list = self.raw["stock_list"]
-        stock_row = stock_list[stock_list["股票代码"] == code]
-        stock_row = stock_row.iloc[0] if len(stock_row) > 0 else None
+        try:
+            stock_list = self.raw["stock_list"]
+            stock_row = stock_list[stock_list["股票代码"] == code]
+            stock_row = stock_row.iloc[0] if len(stock_row) > 0 else None
 
-        kline_df = self.raw["klines"].get(code)
-        financials = self.raw["financials"].get(code)
-        fund_flows = self.raw["fund_flows"].get(code)
-        shareholders = self.raw["shareholders"].get(code)
-        margin = self.raw["margin_trading"].get(code)
-        chips = self.raw["chips"].get(code)
-        dividends = self.raw["dividends"].get(code)
-        industry = self.raw["industry_map"].get(code, "")
-        concept = self.raw["concept_map"].get(code, "")
+            kline_df = self.raw.get("klines", {}).get(code)
+            financials = self.raw.get("financials", {}).get(code)
+            fund_flows = self.raw.get("fund_flows", {}).get(code)
+            shareholders = self.raw.get("shareholders", {}).get(code)
+            margin = self.raw.get("margin", {}).get(code) or self.raw.get("margin_trading", {}).get(code)
+            chips = self.raw.get("chips", {}).get(code)
+            dividends = self.raw.get("dividends", {}).get(code)
+            industry = self.raw.get("industry_map", {}).get(code, "")
+            concept = self.raw.get("concept_map", {}).get(code, "")
 
-        all_factors = {}
-        all_factors.update(self.calc_base_info(code, stock_row) if stock_row is not None else {})
-        all_factors.update(self.calc_industry_factors(code, industry, concept))
-        all_factors.update(self.calc_style_factors(code, kline_df, stock_row))
-        all_factors.update(self.calc_technical_factors(kline_df))
-        all_factors.update(self.calc_fundamental_factors(code, financials, shareholders))
-        all_factors.update(self.calc_fund_flow_factors(code, fund_flows))
-        all_factors.update(self.calc_margin_factors(code, margin))
-        all_factors.update(self.calc_chip_factors(code, chips))
-        all_factors.update(self.calc_dividend_factors(code, dividends))
-        all_factors.update(self.calc_shareholder_factors(code, shareholders))
+            all_factors = {}
+            all_factors.update(self.calc_base_info(code, stock_row) if stock_row is not None else {})
+            all_factors.update(self.calc_industry_factors(code, industry, concept))
+            all_factors.update(self.calc_style_factors(code, kline_df, stock_row))
+            all_factors.update(self.calc_technical_factors(kline_df))
+            all_factors.update(self.calc_fundamental_factors(code, financials, shareholders))
+            all_factors.update(self.calc_fund_flow_factors(code, fund_flows))
+            all_factors.update(self.calc_margin_factors(code, margin))
+            all_factors.update(self.calc_chip_factors(code, chips))
+            all_factors.update(self.calc_dividend_factors(code, dividends))
+            all_factors.update(self.calc_shareholder_factors(code, shareholders))
 
-        return all_factors
+            return all_factors
+        except Exception as e:
+            logger.error(f"  [calc_all_factors] {code} 失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return {}
 
 
 def _to_numeric(val):
-    """将带单位的值转换为数值"""
-    if val is None or pd.isna(val):
+    """将带单位的值转换为数值（DataFrame/Series 防御）"""
+    # 防御：DataFrame/Series 拆到标量
+    if isinstance(val, pd.DataFrame):
+        if val.empty:
+            return None
+        # 单元素 DataFrame → 取唯一标量
+        if val.shape == (1, 1):
+            val = val.iloc[0, 0]
+        else:
+            return None
+    elif isinstance(val, pd.Series):
+        if len(val) == 0:
+            return None
+        if len(val) == 1:
+            val = val.iloc[0]
+        else:
+            val = val.iloc[-1]
+    elif isinstance(val, (list, np.ndarray)):
+        if len(val) == 0:
+            return None
+        val = val[0] if len(val) == 1 else val[-1]
+
+    if val is None:
+        return None
+    if isinstance(val, float) and pd.isna(val):
         return None
     if isinstance(val, (int, float)):
         return float(val)
