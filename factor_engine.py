@@ -818,14 +818,17 @@ class FactorEngine:
         return factors
 
     # ---- 行业/概念因子 ----
-    def calc_industry_factors(self, code: str, industry: str, concept: str) -> dict:
-        """从行业分类和概念板块计算因子"""
+    def calc_industry_factors(self, code: str, industry, concept) -> dict:
+        """从行业分类和概念板块计算因子（防御 DataFrame/Series/list 类型，
+        避免 `if <DataFrame>:` 抛 truth value ambiguous 导致整只票计算失败）。"""
         factors = {}
-        if industry and str(industry) != "nan":
-            factors["行业"] = str(industry)
-            factors["申万一级行业"] = str(industry)
-        if concept and str(concept) != "nan" and len(str(concept)) > 0:
-            factors["概念"] = str(concept)[:200]  # 截断过长概念列表
+        ind = _to_text(industry)
+        con = _to_text(concept)
+        if ind and ind != "nan":
+            factors["行业"] = ind
+            factors["申万一级行业"] = ind
+        if con and con != "nan":
+            factors["概念"] = con[:200]  # 截断过长概念列表
         return factors
 
     # ---- 综合计算 ----
@@ -840,7 +843,10 @@ class FactorEngine:
             financials = self.raw.get("financials", {}).get(code)
             fund_flows = self.raw.get("fund_flows", {}).get(code)
             shareholders = self.raw.get("shareholders", {}).get(code)
-            margin = self.raw.get("margin", {}).get(code) or self.raw.get("margin_trading", {}).get(code)
+            # 不能用 `A or B`：A 若是 DataFrame，bool(DataFrame) 会抛 truth value ambiguous
+            margin = self.raw.get("margin", {}).get(code)
+            if margin is None:
+                margin = self.raw.get("margin_trading", {}).get(code)
             chips = self.raw.get("chips", {}).get(code)
             dividends = self.raw.get("dividends", {}).get(code)
             industry = self.raw.get("industry_map", {}).get(code, "")
@@ -864,6 +870,24 @@ class FactorEngine:
             import traceback
             logger.debug(traceback.format_exc())
             return {}
+
+
+def _to_text(x):
+    """把任意值安全转成纯字符串：DataFrame/Series 取首值、list 拼接、None→空。
+    用于行业/概念等可能被上游建成非标量类型的字段，避免布尔判断报歧义。"""
+    if isinstance(x, pd.DataFrame):
+        if x.empty:
+            return ""
+        x = x.iloc[0, 0]
+    elif isinstance(x, pd.Series):
+        if x.empty:
+            return ""
+        x = x.iloc[0]
+    elif isinstance(x, (list, tuple, set)):
+        return "、".join(str(i) for i in x if i is not None)[:200] if x else ""
+    if x is None:
+        return ""
+    return str(x).strip()
 
 
 def _to_numeric(val):
