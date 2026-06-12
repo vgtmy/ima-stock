@@ -11,6 +11,14 @@ scipy>=1.10.0
 schedule>=1.2.0
 akshare>=1.14.0        # 仅用于股票列表获取，可选
 
+# InStock 整合依赖（MySQL 写入）
+PyMySQL>=1.1.0
+SQLAlchemy>=2.0.0
+
 # 系统依赖
 # Node.js >= v18 (westock-data 运行环境)
 # 安装后首次运行 npx 会自动拉取 westock-data-skillhub@1.0.3
+# TA-Lib C 库（可选，用于更精准的技术指标计算）
+# Windows: https://ta-lib.org/install/ 下载 Windows Installer
+# macOS: brew install ta-lib
+# Linux: apt install libta-lib-dev

@@ -73,7 +73,8 @@ def calc_kdj(high, low, close, n=9, m1=3, m2=3):
         return np.full((3, len(close)), np.nan), np.full((3, len(close)), np.nan), np.full((3, len(close)), np.nan)
     lowest = pd.Series(low).rolling(n).min().values
     highest = pd.Series(high).rolling(n).max().values
-    rsv = np.where(highest != lowest, (close - lowest) / (highest - lowest) * 100, 50)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rsv = np.where(highest != lowest, (close - lowest) / (highest - lowest) * 100, 50)
     k = np.full(len(close), np.nan)
     d = np.full(len(close), np.nan)
     k[n-1] = 50
@@ -119,7 +120,8 @@ def calc_wr(high, low, close, period=14):
         return np.full(len(close), np.nan)
     hh = pd.Series(high).rolling(period).max().values
     ll = pd.Series(low).rolling(period).min().values
-    wr = np.where(hh != ll, (hh - close) / (hh - ll) * 100, 50)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        wr = np.where(hh != ll, (hh - close) / (hh - ll) * 100, 50)
     return wr
 
 def calc_cci(high, low, close, period=14):
@@ -150,7 +152,8 @@ def detect_doji(open_, close, high, low, threshold=0.001):
     """十字星：开盘价≈收盘价，有上下影线"""
     body = np.abs(close - open_)
     total_range = high - low
-    return (body / total_range < threshold) & (total_range > 0)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return (np.where(total_range > 0, body / total_range, np.inf) < threshold) & (total_range > 0)
 
 def detect_hammer(open_, close, high, low):
     """锤子线：下影线≥实体2倍，上影线很短，出现在下跌趋势中"""
@@ -278,8 +281,12 @@ class FactorEngine:
         return factors
 
     # ---- 技术面因子 ----
-    def calc_technical_factors(self, kline_df: Optional[pd.DataFrame]) -> dict:
-        """计算全部技术指标因子"""
+    def calc_technical_factors(self, kline_df: Optional[pd.DataFrame],
+                                talib_ind: Optional[pd.Series] = None) -> dict:
+        """计算全部技术指标因子。
+        talib_ind: 由 instock_bridge.calc_and_write_indicators 预算的 TA-Lib Series，
+                   若传入则用于替换 MACD/KDJ/RSI/BOLL/ATR/WR/CCI/BIAS/TRIX 等核心指标。
+        """
         factors = {}
         if kline_df is None or len(kline_df) < 60:
             return factors
@@ -291,11 +298,52 @@ class FactorEngine:
         volume = kline_df["成交量"].values.astype(float)
         latest_close = close[-1]
 
-        # --- MACD ---
-        dif, dea, macd_bar = calc_macd(close)
-        factors["MACD_DIF"] = round(dif[-1], 4) if not np.isnan(dif[-1]) else np.nan
-        factors["MACD_DEA"] = round(dea[-1], 4) if not np.isnan(dea[-1]) else np.nan
-        factors["MACD_柱"] = round(macd_bar[-1], 4) if not np.isnan(macd_bar[-1]) else np.nan
+        # ── TA-Lib 预算指标注入（优先于 pandas 手算）────────────────────
+        if talib_ind is not None:
+            def _g(key, decimals=4):
+                v = talib_ind.get(key)
+                if v is None:
+                    return np.nan
+                try:
+                    fv = float(v)
+                    return np.nan if np.isnan(fv) or np.isinf(fv) else round(fv, decimals)
+                except (TypeError, ValueError):
+                    return np.nan
+
+            factors["MACD_DIF"]   = _g("macd")
+            factors["MACD_DEA"]   = _g("macds")
+            factors["MACD_柱"]    = _g("macdh")
+            factors["KDJ_K"]      = _g("kdjk", 2)
+            factors["KDJ_D"]      = _g("kdjd", 2)
+            factors["KDJ_J"]      = _g("kdjj", 2)
+            factors["RSI_14"]     = _g("rsi", 2)
+            factors["RSI_6"]      = _g("rsi_6", 2)
+            factors["RSI_12"]     = _g("rsi_12", 2)
+            factors["RSI_24"]     = _g("rsi_24", 2)
+            factors["BOLL_UPPER"] = _g("boll_ub")
+            factors["BOLL_MID"]   = _g("boll")
+            factors["BOLL_LOWER"] = _g("boll_lb")
+            factors["ATR_14"]     = _g("atr")
+            factors["WR_6"]       = _g("wr_6", 2)
+            factors["WR_10"]      = _g("wr_10", 2)
+            factors["CCI_14"]     = _g("cci", 2)
+            factors["BIAS_6"]     = _g("bias", 2)
+            factors["BIAS_12"]    = _g("bias_12", 2)
+            factors["BIAS_24"]    = _g("bias_24", 2)
+            factors["TRIX"]       = _g("trix")
+            factors["MA_10"]      = _g("ma10", 2)
+            factors["MA_20"]      = _g("ma20", 2)
+
+        # ── MACD（pandas fallback，仅在 TA-Lib 未提供时运行）────────────
+        if "MACD_DIF" not in factors or np.isnan(factors.get("MACD_DIF", np.nan)):
+            dif, dea, macd_bar = calc_macd(close)
+            factors["MACD_DIF"] = round(dif[-1], 4) if not np.isnan(dif[-1]) else np.nan
+            factors["MACD_DEA"] = round(dea[-1], 4) if not np.isnan(dea[-1]) else np.nan
+            factors["MACD_柱"] = round(macd_bar[-1], 4) if not np.isnan(macd_bar[-1]) else np.nan
+        else:
+            dif, dea, macd_bar = calc_macd(close)  # 仍需 dif/dea 用于金叉判断
+
+        # --- MACD 金叉/死叉（仍用 kline 序列判断，不依赖单点值）---
 
         # MACD金叉/死叉
         if len(dif) >= 3:
@@ -306,9 +354,10 @@ class FactorEngine:
 
         # --- KDJ ---
         k_vals, d_vals, j_vals = calc_kdj(high, low, close)
-        factors["KDJ_K"] = round(k_vals[-1], 2) if not np.isnan(k_vals[-1]) else np.nan
-        factors["KDJ_D"] = round(d_vals[-1], 2) if not np.isnan(d_vals[-1]) else np.nan
-        factors["KDJ_J"] = round(j_vals[-1], 2) if not np.isnan(j_vals[-1]) else np.nan
+        if "KDJ_K" not in factors or np.isnan(factors.get("KDJ_K", np.nan)):
+            factors["KDJ_K"] = round(k_vals[-1], 2) if not np.isnan(k_vals[-1]) else np.nan
+            factors["KDJ_D"] = round(d_vals[-1], 2) if not np.isnan(d_vals[-1]) else np.nan
+            factors["KDJ_J"] = round(j_vals[-1], 2) if not np.isnan(j_vals[-1]) else np.nan
 
         if len(k_vals) >= 3:
             if k_vals[-2] <= d_vals[-2] and k_vals[-1] > d_vals[-1]:
@@ -317,53 +366,73 @@ class FactorEngine:
                 factors["KDJ死叉"] = True
 
         # --- RSI ---
-        rsi_6 = calc_rsi(close, 6)
-        rsi_12 = calc_rsi(close, 12)
-        rsi_14 = calc_rsi(close, 14)
-        factors["RSI_6"] = round(rsi_6[-1], 2) if not np.isnan(rsi_6[-1]) else np.nan
-        factors["RSI_12"] = round(rsi_12[-1], 2) if not np.isnan(rsi_12[-1]) else np.nan
-        factors["RSI_14"] = round(rsi_14[-1], 2) if not np.isnan(rsi_14[-1]) else np.nan
+        if "RSI_6" not in factors or np.isnan(factors.get("RSI_6", np.nan)):
+            rsi_6 = calc_rsi(close, 6)
+            rsi_12 = calc_rsi(close, 12)
+            rsi_14 = calc_rsi(close, 14)
+            factors["RSI_6"] = round(rsi_6[-1], 2) if not np.isnan(rsi_6[-1]) else np.nan
+            factors["RSI_12"] = round(rsi_12[-1], 2) if not np.isnan(rsi_12[-1]) else np.nan
+            factors["RSI_14"] = round(rsi_14[-1], 2) if not np.isnan(rsi_14[-1]) else np.nan
 
-        if not np.isnan(rsi_6[-1]):
-            if rsi_6[-1] > 80:
+        rsi_6_val = factors.get("RSI_6", np.nan)
+        if not (isinstance(rsi_6_val, float) and np.isnan(rsi_6_val)):
+            if rsi_6_val > 80:
                 factors["RSI超买"] = True
-            elif rsi_6[-1] < 20:
+            elif rsi_6_val < 20:
                 factors["RSI超卖"] = True
 
         # --- BOLL ---
-        upper, mid, lower = calc_boll(close)
-        factors["BOLL上轨"] = round(upper[-1], 2) if not np.isnan(upper[-1]) else np.nan
-        factors["BOLL中轨"] = round(mid[-1], 2) if not np.isnan(mid[-1]) else np.nan
-        factors["BOLL下轨"] = round(lower[-1], 2) if not np.isnan(lower[-1]) else np.nan
+        if "BOLL_UPPER" not in factors or np.isnan(factors.get("BOLL_UPPER", np.nan)):
+            upper, mid, lower = calc_boll(close)
+            factors["BOLL上轨"] = round(upper[-1], 2) if not np.isnan(upper[-1]) else np.nan
+            factors["BOLL中轨"] = round(mid[-1], 2) if not np.isnan(mid[-1]) else np.nan
+            factors["BOLL下轨"] = round(lower[-1], 2) if not np.isnan(lower[-1]) else np.nan
+            boll_upper_val = upper[-1] if not np.isnan(upper[-1]) else np.nan
+            boll_lower_val = lower[-1] if not np.isnan(lower[-1]) else np.nan
+        else:
+            factors["BOLL上轨"] = factors["BOLL_UPPER"]
+            factors["BOLL中轨"] = factors["BOLL_MID"]
+            factors["BOLL下轨"] = factors["BOLL_LOWER"]
+            boll_upper_val = factors["BOLL_UPPER"]
+            boll_lower_val = factors["BOLL_LOWER"]
 
-        if not np.isnan(upper[-1]):
-            if close[-1] > upper[-1]:
+        if not (isinstance(boll_upper_val, float) and np.isnan(boll_upper_val)):
+            if close[-1] > boll_upper_val:
                 factors["BOLL上轨突破"] = True
-            elif close[-1] < lower[-1]:
+            elif close[-1] < boll_lower_val:
                 factors["BOLL下轨突破"] = True
 
         # --- WR ---
-        wr_14 = calc_wr(high, low, close, 14)
-        factors["WR"] = round(wr_14[-1], 2) if not np.isnan(wr_14[-1]) else np.nan
-        if not np.isnan(wr_14[-1]):
-            if wr_14[-1] > 80:
+        if "WR_6" not in factors or np.isnan(factors.get("WR_6", np.nan)):
+            wr_14 = calc_wr(high, low, close, 14)
+            factors["WR"] = round(wr_14[-1], 2) if not np.isnan(wr_14[-1]) else np.nan
+            wr_val = wr_14[-1]
+        else:
+            wr_val = factors.get("WR_6", np.nan)
+
+        if not (isinstance(wr_val, float) and np.isnan(wr_val)):
+            if wr_val > 80:
                 factors["WR超卖"] = True
-            elif wr_14[-1] < 20:
+            elif wr_val < 20:
                 factors["WR超买"] = True
 
         # --- CCI ---
-        cci = calc_cci(high, low, close, 14)
-        factors["CCI"] = round(cci[-1], 2) if not np.isnan(cci[-1]) else np.nan
+        if "CCI_14" not in factors or np.isnan(factors.get("CCI_14", np.nan)):
+            cci = calc_cci(high, low, close, 14)
+            factors["CCI"] = round(cci[-1], 2) if not np.isnan(cci[-1]) else np.nan
+        else:
+            factors["CCI"] = factors["CCI_14"]
 
         # --- BIAS ---
         for p, label in [(6, "BIAS_6"), (12, "BIAS_12"), (24, "BIAS_24")]:
-            bias = calc_bias(close, p)
-            factors[label] = round(bias[-1], 2) if not np.isnan(bias[-1]) else np.nan
+            if label not in factors or np.isnan(factors.get(label, np.nan)):
+                bias = calc_bias(close, p)
+                factors[label] = round(bias[-1], 2) if not np.isnan(bias[-1]) else np.nan
 
-        # --- 均线 & 排列 ---
+        # --- 均线 & 排列（MA_5/60/120/250 始终用 pandas，MA_10/20 TA-Lib 优先）---
         for period, label in [(5, "MA_5"), (10, "MA_10"), (20, "MA_20"),
                                (60, "MA_60"), (120, "MA_120"), (250, "MA_250")]:
-            if len(close) >= period:
+            if label not in factors and len(close) >= period:
                 factors[label] = round(np.mean(close[-period:]), 2)
 
         # 均线排列（日线）
@@ -500,6 +569,9 @@ class FactorEngine:
         income = financials.get("利润表")
         balance = financials.get("资产负债表")
         cashflow = financials.get("现金流量表")
+
+        net_profit_col = None  # 跨块共享，避免 balance 块引用时未赋值
+        rev_col = None
 
         try:
             # --- 盈利能力 ---
@@ -856,7 +928,8 @@ class FactorEngine:
             all_factors.update(self.calc_base_info(code, stock_row) if stock_row is not None else {})
             all_factors.update(self.calc_industry_factors(code, industry, concept))
             all_factors.update(self.calc_style_factors(code, kline_df, stock_row))
-            all_factors.update(self.calc_technical_factors(kline_df))
+            talib_ind = self.raw.get("indicators", {}).get(code)
+            all_factors.update(self.calc_technical_factors(kline_df, talib_ind))
             all_factors.update(self.calc_fundamental_factors(code, financials, shareholders))
             all_factors.update(self.calc_fund_flow_factors(code, fund_flows))
             all_factors.update(self.calc_margin_factors(code, margin))

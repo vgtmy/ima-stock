@@ -4,8 +4,10 @@ A股2200+因子ETL管道 - 全局配置
 ================================
 数据源: westock-data (腾讯自选股行情接口)
 输出格式: field_index_{date}.json + stock_data_{date}.json.gz
+InStock 整合: 写入 MySQL instockdb，驱动 Web UI (localhost:9988)
 """
 import os
+import sys
 import logging
 from datetime import datetime
 
@@ -46,6 +48,24 @@ CONCURRENT_WORKERS = 8        # 并发拉取线程数（dividend/chip/margintrad
 
 # 历史K线回溯天数（用于技术指标计算）
 LOOKBACK_DAYS = 300      # 至少250+交易日确保年线计算
+
+# ============================================================
+# InStock 整合配置
+# ============================================================
+INSTOCK_ROOT = os.path.join(BASE_DIR, "stock")
+if INSTOCK_ROOT not in sys.path:
+    sys.path.insert(0, INSTOCK_ROOT)
+
+# MySQL 数据库（与 stock/instock/lib/database.py 保持一致，支持环境变量覆盖）
+DB_HOST     = os.environ.get("db_host", "localhost")
+DB_USER     = os.environ.get("db_user", "root")
+DB_PASSWORD = os.environ.get("db_password", "ntmy904530")
+DB_NAME     = os.environ.get("db_database", "instockdb")
+DB_PORT     = int(os.environ.get("db_port", "3306"))
+
+# 功能开关（可通过环境变量关闭）
+WRITE_TO_DB = os.environ.get("WRITE_TO_DB", "true").lower() == "true"
+USE_TALIB   = os.environ.get("USE_TALIB", "true").lower() == "true"
 
 # ============================================================
 # 日志配置

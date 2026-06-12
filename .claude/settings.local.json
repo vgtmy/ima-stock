@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python analyze_stocks.py)",
+      "Bash(chcp 65001)",
+      "Bash(PYTHONIOENCODING=utf-8 python analyze_stocks.py)",
+      "Bash(iconv -f gbk -t utf-8)",
+      "Bash(git push *)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ]
+  }
+}

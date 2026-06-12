@@ -8,11 +8,14 @@
 - 查询 markdown 文件夹 ID
 - 上传文件到指定文件夹
 - 支持覆盖更新
+
+凭证优先级: 本地 ~/.ima_credentials > 环境变量
 """
 import os
 import json
 import subprocess
 import requests
+from pathlib import Path
 from typing import Optional, Tuple
 
 from config import (
@@ -20,10 +23,63 @@ from config import (
 )
 
 # ============================================================
-# IMA API 凭证（从环境变量获取）
+# IMA API 凭证加载（本地文件 > 环境变量）
 # ============================================================
-CLIENT_ID = os.environ.get("IMA_OPENAPI_CLIENTID", "")
-API_KEY = os.environ.get("IMA_OPENAPI_APIKEY", "")
+def _load_credentials() -> Tuple[str, str]:
+    """
+    加载 IMA API 凭证
+    优先级:
+      1) ~/.ima_credentials (用户主目录，本地文件，最安全)
+      2) 环境变量 IMA_OPENAPI_CLIENTID / IMA_OPENAPI_APIKEY
+    文件格式: KEY=VALUE  每行一对
+    """
+    client_id = ""
+    api_key = ""
+
+    # 1) 优先从本地文件读取
+    cred_file = Path.home() / ".ima_credentials"
+    if cred_file.exists():
+        try:
+            for line in cred_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if k == "IMA_OPENAPI_CLIENTID":
+                        client_id = v
+                    elif k == "IMA_OPENAPI_APIKEY":
+                        api_key = v
+            if client_id and api_key:
+                logger.info(f"[凭证] 从本地文件加载: {cred_file}")
+                return client_id, api_key
+        except Exception as e:
+            logger.warning(f"[凭证] 读取本地文件失败，回退环境变量: {e}")
+
+    # 2) 回退到环境变量
+    client_id = os.environ.get("IMA_OPENAPI_CLIENTID", "")
+    api_key = os.environ.get("IMA_OPENAPI_APIKEY", "")
+    if client_id and api_key:
+        logger.info("[凭证] 从环境变量加载")
+    return client_id, api_key
+
+
+CLIENT_ID, API_KEY = _load_credentials()
+
+
+def check_credentials() -> bool:
+    """诊断凭证状态（不暴露密钥本身）"""
+    cred_file = Path.home() / ".ima_credentials"
+    print(f"📁 凭证文件: {cred_file}")
+    print(f"   存在: {cred_file.exists()}")
+    if cred_file.exists():
+        print(f"   大小: {cred_file.stat().st_size} bytes")
+    print(f"🔑 CLIENT_ID 长度: {len(CLIENT_ID)}")
+    print(f"🔑 API_KEY 长度: {len(API_KEY)}")
+    ok = bool(CLIENT_ID and API_KEY)
+    print(f"{'✅ 凭证就绪' if ok else '❌ 凭证缺失'}")
+    return ok
 
 
 def _api_post(endpoint: str, body: dict) -> dict:
