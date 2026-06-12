@@ -24,13 +24,14 @@ from output_generator import generate_output
 from uploader import upload_data_files
 
 
-def run_etl_pipeline(target_date: str = None, upload: bool = True):
+def run_etl_pipeline(target_date: str = None, upload: bool = True, force_refetch: bool = False):
     """
     执行完整 ETL 管道
 
     Args:
         target_date: YYYY-MM-DD，默认今天
         upload: 是否上传到知识库
+        force_refetch: 强制重新拉取数据（忽略已有快照）
     """
     if target_date is None:
         target_date = datetime.now().strftime("%Y-%m-%d")
@@ -44,7 +45,8 @@ def run_etl_pipeline(target_date: str = None, upload: bool = True):
     logger.info(f"🔵 Phase 1/4: 数据采集 ({target_date})")
     logger.info("=" * 60)
     t1 = time.time()
-    raw_data = fetch_all_data(target_date=target_date, use_cache=False)
+    # 如果有快照且不强制重拉，直接用 use_cache=True 让 data_fetcher 优先找快照
+    raw_data = fetch_all_data(target_date=target_date, use_cache=not force_refetch)
     t1_elapsed = time.time() - t1
     logger.info(f"  耗时: {t1_elapsed:.0f}s")
 
@@ -126,6 +128,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="A股2200+因子ETL管道")
     parser.add_argument("date", nargs="?", default=None, help="目标日期 YYYY-MM-DD")
     parser.add_argument("--no-upload", action="store_true", help="仅本地生成，不上传知识库")
+    parser.add_argument("--force-refetch", action="store_true", help="强制重新拉取数据（忽略已有快照）")
     args = parser.parse_args()
 
-    run_etl_pipeline(target_date=args.date, upload=not args.no_upload)
+    run_etl_pipeline(
+        target_date=args.date,
+        upload=not args.no_upload,
+        force_refetch=args.force_refetch
+    )

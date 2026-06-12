@@ -42,6 +42,7 @@ REQUEST_INTERVAL = 0.5   # 批次间请求间隔(秒)（腾讯源友好）
 BATCH_SIZE = 100         # 批量日志输出间隔
 COOLDOWN_AFTER_FAILURES = 3   # 连续失败N次后进入冷却
 COOLDOWN_SLEEP = 30.0         # 冷却休眠秒数（腾讯源友好，减短）
+CONCURRENT_WORKERS = 8        # 并发拉取线程数（dividend/chip/margintrade/shareholder）
 
 # 历史K线回溯天数（用于技术指标计算）
 LOOKBACK_DAYS = 300      # 至少250+交易日确保年线计算
